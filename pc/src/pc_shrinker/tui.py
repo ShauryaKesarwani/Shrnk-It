@@ -15,7 +15,15 @@ from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Sta
 
 from .adb import AdbClient, RemoteItem
 from .backups import BackupStore
-from .encoding import EncodingSettings, VIDEO_EXTENSIONS, IMAGE_EXTENSIONS, available_tools, encode, make_preview
+from .encoding import (
+    EncodingSettings,
+    IMAGE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+    available_tools,
+    encode,
+    make_preview,
+    make_video_quality_preview,
+)
 from .processor import compress_one
 
 ANDROID_ROOT = "/sdcard"
@@ -106,15 +114,23 @@ class MediaApp(App[None]):
     #dialog Button { margin-right: 2; }
     """
     BINDINGS = [
-        Binding("q", "quit", "Quit"), Binding("space", "toggle", "Select"),
-        Binding("enter", "open_or_toggle", "Open/select"), Binding("backspace", "parent", "Parent"),
-        Binding("p", "preview", "Preview"), Binding("c", "compress", "Compress"),
-        Binding("s", "settings", "Settings"), Binding("r", "restore", "Backups/restore"),
-        Binding("ctrl+r", "refresh", "Refresh"),
-        Binding("i", "toggle_images", "Toggle JPEGs"),
+        Binding("q", "quit", "Quit", priority=True),
+        Binding("space", "toggle", "Select", priority=True),
+        Binding("enter", "open_or_toggle", "Open/select", priority=True),
+        Binding("backspace", "parent", "Parent", priority=True),
+        Binding("p", "preview", "Preview", priority=True),
+        Binding("c", "compress", "Compress", priority=True),
+        Binding("s", "settings", "Settings", priority=True),
+        Binding("r", "restore", "Backups/restore", priority=True),
+        Binding("ctrl+r", "refresh", "Refresh", priority=True),
+        Binding("i", "toggle_images", "Toggle JPEGs", priority=True),
     ]
+    _MAIN_ACTIONS = {
+        "quit", "toggle", "open_or_toggle", "parent", "preview", "compress",
+        "settings", "restore", "refresh", "toggle_images",
+    }
 
-    def __init__(self, start: str = "/sdcard/DCIM/Camera", backup_dir: Path | None = None):
+    def __init__(self, start: str = "/sdcard", backup_dir: Path | None = None):
         super().__init__()
         self.adb = AdbClient()
         self.path = self.adb.validate_path(start)
@@ -123,6 +139,13 @@ class MediaApp(App[None]):
         self.selected: dict[str, RemoteItem] = {}
         self.settings = EncodingSettings()
         self.include_images = False
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        # Priority app bindings beat DataTable's built-in Space/Enter actions, but
+        # should not steal keystrokes or button navigation from modal screens.
+        if len(self.screen_stack) > 1 and action in self._MAIN_ACTIONS:
+            return False
+        return True
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -211,13 +234,15 @@ class MediaApp(App[None]):
         self._status("JPEG files included" if self.include_images else "JPEG files hidden (video-only mode)")
         self.refresh_listing()
 
-    async def action_settings(self) -> None:
-        changed = await self.push_screen_wait(SettingsScreen(self.settings))
+    def action_settings(self) -> None:
+        self.push_screen(SettingsScreen(self.settings), callback=self._apply_settings)
+
+    def _apply_settings(self, changed: EncodingSettings | None) -> None:
         if changed:
             self.settings = changed
             self._status(f"Settings updated · CRF {changed.video_crf} / JPEG {changed.jpeg_quality} / minimum saving {changed.min_saving_percent:g}%")
 
-    async def action_preview(self) -> None:
+    def action_preview(self) -> None:
         item = next(iter(self.selected.values()), None) or self._current()
         if not item or item.is_dir:
             self._status("Select or highlight a supported video/JPEG first")
@@ -225,6 +250,7 @@ class MediaApp(App[None]):
         if item.suffix in IMAGE_EXTENSIONS and not self.include_images:
             self._status("JPEG preview is disabled")
             return
+        self._status(f"Preparing quick quality preview for {item.name}…")
         self._preview_worker(item)
 
     @work(thread=True, exclusive=True)
@@ -237,8 +263,11 @@ class MediaApp(App[None]):
                 compressed = directory / ("compressed" + item.suffix)
                 preview = directory / "quality-comparison.jpg"
                 self.adb.pull(item.path, str(source))
-                encode(source, compressed, kind, self.settings)
-                make_preview(source, compressed, kind, preview)
+                if kind == "video":
+                    make_video_quality_preview(source, self.settings, preview)
+                else:
+                    encode(source, compressed, kind, self.settings)
+                    make_preview(source, compressed, kind, preview)
                 # The comparison file must survive the temporary-directory cleanup.
                 persistent = self.backups.root / "previews" / f"{Path(item.name).stem}-comparison.jpg"
                 persistent.parent.mkdir(parents=True, exist_ok=True)
@@ -248,7 +277,7 @@ class MediaApp(App[None]):
         except Exception as exc:
             self.call_from_thread(self._status, f"Preview failed: {exc}")
 
-    async def action_compress(self) -> None:
+    def action_compress(self) -> None:
         items = list(self.selected.values())
         if not items:
             self._status("Select one or more files before compressing")
@@ -257,12 +286,16 @@ class MediaApp(App[None]):
         if unsupported:
             self._status("Unsupported selection: " + ", ".join(unsupported))
             return
-        accepted = await self.push_screen_wait(DecisionScreen(
+        self.push_screen(DecisionScreen(
             f"Compress and replace {len(items)} phone file(s)? Originals will be backed up first.\n"
             f"CRF {self.settings.video_crf}, JPEG {self.settings.jpeg_quality}, minimum saving {self.settings.min_saving_percent:g}%."
-        ))
+        ), callback=lambda accepted: self._confirm_compression(accepted, items, self.settings))
+
+    def _confirm_compression(
+        self, accepted: bool, items: list[RemoteItem], settings: EncodingSettings
+    ) -> None:
         if accepted:
-            self._compress_worker(items, self.settings)
+            self._compress_worker(items, settings)
 
     @work(thread=True, exclusive=True)
     def _compress_worker(self, items: list[RemoteItem], settings: EncodingSettings) -> None:
@@ -275,12 +308,14 @@ class MediaApp(App[None]):
                 self.call_from_thread(self._status, f"Failed {item.name}: {exc}")
         self.call_from_thread(self.refresh_listing)
 
-    async def action_restore(self) -> None:
+    def action_restore(self) -> None:
         records = self.backups.records()
         if not records:
             self._status(f"No backups found in {self.backups.root}")
             return
-        backup_id = await self.push_screen_wait(BackupScreen(records))
+        self.push_screen(BackupScreen(records), callback=self._backup_selected)
+
+    def _backup_selected(self, backup_id: str | None) -> None:
         if not backup_id:
             return
         try:
@@ -291,13 +326,17 @@ class MediaApp(App[None]):
         exists = self.adb.exists(str(record["phone_path"]))
         overwrite = False
         if exists:
-            overwrite = await self.push_screen_wait(DecisionScreen(
+            self.push_screen(DecisionScreen(
                 f"{record['phone_path']} already exists on the phone. Overwrite it with backup {backup_id}?"
-            ))
-            if not overwrite:
-                self._status("Restore cancelled")
-                return
+            ), callback=lambda confirmed: self._confirm_restore(confirmed, backup_id))
+            return
         self._restore_worker(backup_id, overwrite)
+
+    def _confirm_restore(self, confirmed: bool, backup_id: str) -> None:
+        if confirmed:
+            self._restore_worker(backup_id, overwrite=True)
+        else:
+            self._status("Restore cancelled")
 
     @work(thread=True, exclusive=True)
     def _restore_worker(self, backup_id: str, overwrite: bool) -> None:

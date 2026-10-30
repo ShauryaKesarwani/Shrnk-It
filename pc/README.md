@@ -16,7 +16,7 @@ uv run android-media-shrinker check
 uv run android-media-shrinker
 ```
 
-The TUI opens in `/sdcard/DCIM/Camera`. Navigate with arrows; Space selects, Enter opens a folder or toggles a file, Backspace goes up, `P` previews, `C` compresses selected files after confirmation, `S` edits settings, `I` toggles JPEG visibility, and `R` lists/restores backups.
+The TUI opens at `/sdcard`, the shared-storage root visible to Android file explorers. Browse folders such as `DCIM`, `Download`, `Movies`, and `Pictures`; app-private `Android/data` and `Android/obb` are excluded. Navigate with arrows; Space selects, Enter opens a folder or toggles a file, Backspace goes up, `P` previews, `C` compresses selected files after confirmation, `S` edits settings, `I` toggles JPEG visibility, and `R` lists/restores backups.
 
 ## External tools
 
@@ -34,7 +34,7 @@ uv run android-media-shrinker backups
 uv run android-media-shrinker restore <backup-id>
 ```
 
-`compress` is preview/dry-run by default. Add `--apply` to replace after an interactive `REPLACE` confirmation; `--yes` skips that prompt and is intended only for deliberate scripts. JPEG work always requires `--include-images`. `preview` downloads the source to a temporary folder, encodes a sample with the selected settings, and opens a side-by-side image comparison in the system viewer. Video previews compare frames at roughly 20%, 50%, and 80% of the clip. Adjust parameters with `--crf`, `--jpeg-quality`, and `--min-saving-percent` or the TUI settings screen.
+`compress` is preview/dry-run by default. Add `--apply` to replace after an interactive `REPLACE` confirmation; `--yes` skips that prompt and is intended only for deliberate scripts. JPEG work always requires `--include-images`. `preview` downloads the source and opens a side-by-side comparison in the system viewer. Video previews encode only three representative still frames (roughly 20%, 50%, and 80% of the clip), rather than re-encoding the whole video; they use FFmpeg's fast preset, so treat this as a quick quality estimate, not a guarantee of final playback quality. Adjust parameters with `--crf`, `--jpeg-quality`, and `--min-saving-percent` or the TUI settings screen.
 
 ## Safety and recovery
 

@@ -107,6 +107,51 @@ def make_preview(source: Path, compressed: Path, kind: str, destination: Path) -
     return destination
 
 
+def make_video_quality_preview(source: Path, settings: EncodingSettings, destination: Path) -> Path:
+    """Encode only three representative still frames, not the entire video."""
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        raise EncodingError("FFmpeg and ffprobe are required for video previews")
+    duration = _video_duration(source)
+    originals: list[Image.Image] = []
+    compressed: list[Image.Image] = []
+    with tempfile.TemporaryDirectory(prefix="video-quality-preview-") as td:
+        directory = Path(td)
+        for index, fraction in enumerate((0.2, 0.5, 0.8)):
+            timestamp = max(0.0, min(duration * fraction, duration - 0.05))
+            original_frame = directory / f"original-{index}.jpg"
+            encoded_frame = directory / f"encoded-{index}.mp4"
+            decoded_frame = directory / f"compressed-{index}.jpg"
+            _run_preview_ffmpeg([
+                "-ss", f"{timestamp:.3f}", "-i", str(source), "-frames:v", "1",
+                "-q:v", "2", "-y", str(original_frame),
+            ])
+            _run_preview_ffmpeg([
+                "-ss", f"{timestamp:.3f}", "-i", str(source), "-frames:v", "1", "-an",
+                "-c:v", "libx265", "-preset", "ultrafast", "-crf", str(settings.video_crf),
+                "-pix_fmt", "yuv420p", "-tag:v", "hvc1", "-y", str(encoded_frame),
+            ])
+            _run_preview_ffmpeg([
+                "-i", str(encoded_frame), "-frames:v", "1", "-q:v", "2", "-y", str(decoded_frame),
+            ])
+            with Image.open(original_frame) as image:
+                originals.append(image.convert("RGB"))
+            with Image.open(decoded_frame) as image:
+                compressed.append(image.convert("RGB"))
+        _write_contact_sheet(originals, compressed, destination)
+    for image in originals + compressed:
+        image.close()
+    return destination
+
+
+def _run_preview_ffmpeg(arguments: list[str]) -> None:
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", *arguments],
+        text=True, capture_output=True, check=False,
+    )
+    if result.returncode:
+        raise EncodingError(result.stderr.strip() or "Could not generate video quality preview")
+
+
 def _video_duration(path: Path) -> float:
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],

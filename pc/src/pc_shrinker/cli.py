@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .adb import AdbClient
 from .backups import BackupStore
-from .encoding import EncodingSettings, available_tools, encode, make_preview
+from .encoding import EncodingSettings, available_tools, encode, make_preview, make_video_quality_preview
 from .processor import compress_one, media_kind
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -210,8 +210,11 @@ def show_preview(path: str, include_images: bool, settings: EncodingSettings, ba
         compressed = directory / ("compressed" + Path(path).suffix.lower())
         sheet = directory / "quality-comparison.jpg"
         adb.pull(path, str(source))
-        encode(source, compressed, kind, settings)
-        make_preview(source, compressed, kind, sheet)
+        if kind == "video":
+            make_video_quality_preview(source, settings, sheet)
+        else:
+            encode(source, compressed, kind, settings)
+            make_preview(source, compressed, kind, sheet)
         persistent = backups.root / "previews" / f"{Path(path).stem}-comparison.jpg"
         persistent.parent.mkdir(parents=True, exist_ok=True)
         sheet.replace(persistent)

@@ -6,7 +6,7 @@ import pytest
 
 from pc_shrinker.adb import AdbClient
 from pc_shrinker.backups import BackupStore
-from pc_shrinker.encoding import EncodingSettings, encode, make_preview
+from pc_shrinker.encoding import EncodingSettings, encode, make_preview, make_video_quality_preview
 from pc_shrinker.processor import compress_one, media_kind
 
 
@@ -32,6 +32,25 @@ def test_android_path_rejects_escape_and_control_characters(path):
 
 def test_android_root_can_be_browsed():
     assert AdbClient.validate_path("/sdcard") == "/sdcard"
+
+
+def test_android_listing_hides_restricted_data_and_obb_folders(monkeypatch):
+    import subprocess
+
+    client = AdbClient(executable="adb")
+    output = "\n".join([
+        "directory|0|1|/sdcard/Android/data",
+        "directory|0|1|/sdcard/Android/obb",
+        "directory|0|1|/sdcard/Android/media",
+    ])
+    monkeypatch.setattr(
+        client, "shell",
+        lambda command, check=True: subprocess.CompletedProcess([], 0, output, ""),
+    )
+
+    listed = client.list_dir("/sdcard/Android")
+
+    assert [item.path for item in listed] == ["/sdcard/Android/media"]
 
 
 def test_adb_passes_windows_paths_as_single_subprocess_arguments(monkeypatch):
@@ -218,3 +237,21 @@ def test_jpeg_compresses_and_builds_comparison_preview(tmp_path: Path):
 
     assert compressed.is_file()
     assert Image.open(comparison).size == (960, 332)
+
+
+def test_video_quality_preview_encodes_only_sample_frames(tmp_path: Path):
+    import subprocess
+
+    source = tmp_path / "source.mp4"
+    comparison = tmp_path / "comparison.jpg"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+         "testsrc=size=160x120:rate=8", "-t", "1.5", "-pix_fmt", "yuv420p", "-y", str(source)],
+        check=True,
+    )
+
+    make_video_quality_preview(source, EncodingSettings(video_crf=30), comparison)
+
+    from PIL import Image
+    with Image.open(comparison) as sheet:
+        assert sheet.size == (960, (300 + 32) * 3)

@@ -111,7 +111,9 @@ class AdbClient:
             try:
                 kind, size, mtime, remote_path = line.split("|", 3)
                 remote_path = self.validate_path(remote_path)
-                if remote_path.startswith(("/sdcard/Android/data/", "/sdcard/Android/obb/")):
+                if remote_path in {"/sdcard/Android/data", "/sdcard/Android/obb"} or remote_path.startswith(
+                    ("/sdcard/Android/data/", "/sdcard/Android/obb/")
+                ):
                     continue
                 entries.append(RemoteItem(remote_path, "directory" in kind, int(size), int(mtime)))
             except (ValueError, TypeError):
