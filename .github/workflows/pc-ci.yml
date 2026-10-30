@@ -1,0 +1,39 @@
+name: PC app checks
+
+on:
+  push:
+    paths:
+      - "pc/**"
+      - ".github/workflows/pc-ci.yml"
+  pull_request:
+    paths:
+      - "pc/**"
+      - ".github/workflows/pc-ci.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Python tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    defaults:
+      run:
+        working-directory: pc
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: pc/uv.lock
+      - name: Install locked project dependencies
+        run: uv sync --locked --dev
+      - name: Run tests
+        run: uv run --locked pytest -q
+      - name: Verify CLI entry point
+        run: uv run --locked android-media-shrinker --help

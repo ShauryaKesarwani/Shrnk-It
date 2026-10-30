@@ -75,3 +75,7 @@ The requested policy is either a default age limit of **30 days** or keeping onl
 - Package-manager availability differs by Linux distribution. Only offer known managers (for example, winget, apt, dnf, pacman, and Homebrew); otherwise provide manual setup instructions.
 - Local binary installation needs secure source and integrity verification and must be removable without affecting the rest of the system.
 - Backup retention details (30-day default versus a 2–3-version cap) need confirmation before automatic cleanup is implemented.
+
+## Implementation status
+
+The initial PC app is implemented in `src/pc_shrinker/`: Textual browsing/selection, CLI commands, settings, JPEG/video compression, side-by-side preview images, backup manifests with SHA-256 verification, guarded replace/restore, and a setup assistant. `uv run pytest` exercises local/core behavior without a device. External tools are checked and existing PATH installations are reused. Global installation is opt-in; the local `bins/` option currently provides secure manual installation guidance rather than downloading executable binaries. Automatic backup cleanup is intentionally not implemented until the retention policy is settled. `.github/workflows/pc-ci.yml` runs the locked install, tests, and CLI check on Ubuntu and Windows; real-device behavior still requires a connected phone and manual verification.
