@@ -47,3 +47,10 @@ kotlin {
 flutter {
     source = "../.."
 }
+
+dependencies {
+    implementation("androidx.media3:media3-transformer:1.11.1")
+    implementation("androidx.media3:media3-effect:1.11.1")
+    implementation("androidx.media3:media3-common:1.11.1")
+    implementation("androidx.exifinterface:exifinterface:1.4.2")
+}

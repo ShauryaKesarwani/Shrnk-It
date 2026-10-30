@@ -31,6 +31,16 @@ Replacement may be interrupted and may not be atomic. Preserve verified backups 
 
 ## Current status
 
-Flutter Android and web project files and an initial Material 3 screen exist. The Android document picker selects media, with search and sorting within the selection; this native integration has not yet been tested on a device. MediaStore browsing, dynamic wallpaper colors, codecs, backups and all processing are still pending. The web target is for UI development only. Android SDK and device validation will happen on the other desktop.
+Flutter Android and web project files and an initial Material 3 screen exist. Android 12+ supplies a wallpaper-derived accent to seed Flutter's palette; this is not the full system tonal palette. The Android photo picker (document picker fallback) and MediaStore browser select media, with search, folder filters and size sorting. These native integrations have not yet been tested on a device; Android permissions can limit which media is visible. Full compression and replacement are still pending. The web target is for UI development only. Android SDK and device validation will happen on the other desktop.
 
 Initial pure Dart search, size sorting, and minimum-savings rules have unit tests; they are not yet connected to Android media or replacement operations.
+
+The Android bridge reports advertised H.265 encoding/decoding and H.264 encoding availability. The UI displays encoder availability; the actual encoder choice, decoder details and real-device validation are still pending. Advertising a codec does not guarantee that it can encode a particular resolution or input.
+
+Pure Dart retention suggestions and a batch coordinator cover backup verification, unchanged-source checks, savings thresholds, replacement verification, and per-item failure reporting. They are not connected to Android storage, codecs, or UI and do not yet perform any file operations.
+
+A Media3 video sample exporter writes only to app cache and is connected to a frame comparison screen. It has not been tested with the Android toolchain. Media3 may transmux inputs that already match the requested format, so it is not yet a reliable compression comparison implementation. An initial backup action asks for a folder, copies selected files, and reads each copy back to verify SHA-256. It saves a metadata sidecar with each backup and lists its app-private index. A restore-as-copy action verifies the backup and the new copy. Android code has not been compiled or tested on a device. In-place restore and sidecar re-import are not implemented; replacing originals remains disabled. The app-private index could be lost on uninstall, so it is not yet an adequate restore system.
+
+JPEG quality previews decode a memory-bounded image and compare display versions in memory. They do not encode the final file or account for all JPEG metadata and orientation; they need Android testing.
+
+Initial JPEG and video actions prepare cache copies and offer to save a separate document only when it meets a configurable minimum saving (20% by default). JPEG supports photos up to 16 megapixels and preserves orientation and basic date/camera EXIF fields; other metadata may be lost. Video requests a configurable bitrate but Media3 can transmux rather than compress and devices can ignore encoder settings. These paths are not Android-built or device-tested; they do not replace the original or implement batch compression.

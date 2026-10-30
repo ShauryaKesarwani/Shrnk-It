@@ -31,6 +31,20 @@ jobs:
           python-version: "3.13"
           enable-cache: true
           cache-dependency-glob: pc/uv.lock
+      - name: Install FFmpeg (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+      - name: Install FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install ffmpeg --yes --no-progress
+          $ffmpegBin = Get-ChildItem "$env:ProgramData\chocolatey\lib\ffmpeg*" -Filter ffmpeg.exe -Recurse |
+            Select-Object -First 1 -ExpandProperty DirectoryName
+          if (-not $ffmpegBin) { throw "FFmpeg executable was not found after Chocolatey installation" }
+          $ffmpegBin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Install locked project dependencies
         run: uv sync --locked --dev
       - name: Run tests
