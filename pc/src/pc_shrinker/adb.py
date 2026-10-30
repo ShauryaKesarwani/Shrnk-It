@@ -8,6 +8,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
+SHARED_STORAGE = "/storage/emulated/0"
+
 
 @dataclass(frozen=True)
 class RemoteItem:
@@ -93,13 +95,16 @@ class AdbClient:
 
     def list_dir(self, path: str) -> list[RemoteItem]:
         path = self.validate_path(path)
+        # /sdcard commonly resolves to /storage/self/primary. Toybox find does not
+        # follow that symlink when it is the starting point, yielding zero entries.
+        shell_path = SHARED_STORAGE + path.removeprefix("/sdcard")
         fmt = shlex.quote("%F|%s|%Y|%n")
-        command = f"find {shlex.quote(path)} -mindepth 1 -maxdepth 1 -exec stat -c {fmt} {{}} +"
+        command = f"find {shlex.quote(shell_path)} -mindepth 1 -maxdepth 1 -exec stat -c {fmt} {{}} +"
         result = self.shell(command, check=False)
         if result.returncode:
             # Some Android toybox versions lack batched -exec; still one ADB round trip.
             command = (
-                f"find {shlex.quote(path)} -mindepth 1 -maxdepth 1 | "
+                f"find {shlex.quote(shell_path)} -mindepth 1 -maxdepth 1 | "
                 f"while IFS= read -r p; do stat -c {fmt} \"$p\"; done"
             )
             result = self.shell(command, check=False)
@@ -110,7 +115,14 @@ class AdbClient:
         for line in result.stdout.splitlines():
             try:
                 kind, size, mtime, remote_path = line.split("|", 3)
+                if remote_path == SHARED_STORAGE:
+                    remote_path = "/sdcard"
+                elif remote_path.startswith(SHARED_STORAGE + "/"):
+                    remote_path = "/sdcard" + remote_path.removeprefix(SHARED_STORAGE)
                 remote_path = self.validate_path(remote_path)
+                name = PurePosixPath(remote_path).name
+                if name.startswith((".", "$")) or name.endswith("$"):
+                    continue
                 if remote_path in {"/sdcard/Android/data", "/sdcard/Android/obb"} or remote_path.startswith(
                     ("/sdcard/Android/data/", "/sdcard/Android/obb/")
                 ):

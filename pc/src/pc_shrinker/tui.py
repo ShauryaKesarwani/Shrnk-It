@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import tempfile
-import webbrowser
 from pathlib import Path, PurePosixPath
 
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.coordinate import Coordinate
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Static
 
@@ -21,8 +21,10 @@ from .encoding import (
     VIDEO_EXTENSIONS,
     available_tools,
     encode,
+    image_to_terminal,
     make_preview,
-    make_video_quality_preview,
+    make_video_quality_samples,
+    make_video_thumbnail_sheet,
 )
 from .processor import compress_one
 
@@ -102,6 +104,209 @@ class BackupScreen(ModalScreen[str | None]):
             self.dismiss(None)
 
 
+class QualityPreviewScreen(ModalScreen[EncodingSettings | None]):
+    """Inline frame/photo comparison with controls to tune and regenerate quality."""
+
+    CSS = """
+    #quality-dialog { width: 100%; height: 100%; padding: 0 1; background: $surface; }
+    #quality-heading { height: 1; color: $accent; }
+    #quality-image { height: 1fr; content-align: center middle; overflow: hidden; }
+    #quality-nav, #quality-settings, #quality-actions { height: 3; align: center middle; }
+    #quality-settings Input { width: 12; margin: 0 1; }
+    #quality-settings Label { margin-left: 1; }
+    #quality-actions Button, #quality-nav Button { margin: 0 1; }
+    """
+    BINDINGS = [Binding("escape", "cancel", "Close")]
+
+    def __init__(
+        self,
+        title: str,
+        kind: str,
+        source: Path,
+        sample_dir: Path,
+        sample_paths: list[Path],
+        settings: EncodingSettings,
+        temp_dir: tempfile.TemporaryDirectory[str],
+    ):
+        super().__init__()
+        self.title_text = title
+        self.kind = kind
+        self.source = source
+        self.sample_dir = sample_dir
+        self.sample_paths = sample_paths
+        self.settings = settings
+        self.previewed_settings = settings
+        self.temp_dir = temp_dir
+        self.sample_index = 0
+        self._timer = None
+        self._regenerating = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="quality-dialog"):
+            yield Static(self._heading(), id="quality-heading")
+            yield Static(image_to_terminal(self.sample_paths[0]), id="quality-image")
+            with Horizontal(id="quality-nav"):
+                yield Button("Previous", id="previous", disabled=len(self.sample_paths) < 2)
+                yield Button("Auto 0.3s", id="auto", disabled=len(self.sample_paths) < 2)
+                yield Button("Next", id="next", disabled=len(self.sample_paths) < 2)
+            with Horizontal(id="quality-settings"):
+                yield Label("CRF")
+                yield Input(str(self.settings.video_crf), id="crf", type="integer")
+                yield Label("JPEG quality")
+                yield Input(str(self.settings.jpeg_quality), id="jpeg", type="integer")
+                yield Label("Min saving %")
+                yield Input(str(self.settings.min_saving_percent), id="saving")
+            with Horizontal(id="quality-actions"):
+                yield Button("Update preview", variant="primary", id="regenerate")
+                yield Button("Use these settings", variant="success", id="use")
+                yield Button("Cancel", id="cancel")
+
+    def _heading(self) -> str:
+        point = (15, 38, 62, 85)[min(self.sample_index, 3)] if self.kind == "video" else None
+        sample = f" · source point {point}%" if point else ""
+        return f"{self.title_text} · original vs compressed{sample} · CRF lower = higher quality"
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id
+        if button_id == "cancel":
+            self.action_cancel()
+        elif button_id == "previous":
+            self._show_sample(self.sample_index - 1)
+        elif button_id == "next":
+            self._show_sample(self.sample_index + 1)
+        elif button_id == "auto":
+            self._toggle_auto_cycle()
+        elif button_id == "regenerate":
+            self._start_regenerate()
+        elif button_id == "use":
+            self._accept_settings()
+
+    def _show_sample(self, index: int) -> None:
+        self.sample_index = index % len(self.sample_paths)
+        self.query_one("#quality-heading", Static).update(self._heading())
+        self.query_one("#quality-image", Static).update(image_to_terminal(self.sample_paths[self.sample_index]))
+
+    def _toggle_auto_cycle(self) -> None:
+        button = self.query_one("#auto", Button)
+        if self._timer is None:
+            self._timer = self.set_interval(0.3, self._advance_sample)
+            button.label = "Stop auto"
+        else:
+            self._timer.stop()
+            self._timer = None
+            button.label = "Auto 0.3s"
+
+    def _advance_sample(self) -> None:
+        self._show_sample(self.sample_index + 1)
+
+    def _read_settings(self) -> EncodingSettings | None:
+        try:
+            settings = EncodingSettings(
+                video_crf=int(self.query_one("#crf", Input).value),
+                jpeg_quality=int(self.query_one("#jpeg", Input).value),
+                min_saving_percent=float(self.query_one("#saving", Input).value),
+            )
+            settings.validate()
+            return settings
+        except ValueError as exc:
+            self.notify(str(exc), severity="error")
+            return None
+
+    def _start_regenerate(self) -> None:
+        settings = self._read_settings()
+        if settings is None or self._regenerating:
+            return
+        self._regenerating = True
+        self.query_one("#regenerate", Button).disabled = True
+        self.query_one("#quality-heading", Static).update("Generating preview samples with the new settings…")
+        self._regenerate_worker(settings)
+
+    @work(thread=True, exclusive=True)
+    def _regenerate_worker(self, settings: EncodingSettings) -> None:
+        try:
+            if self.kind == "video":
+                samples = make_video_quality_samples(self.source, settings, self.sample_dir)
+            else:
+                compressed = self.sample_dir / "photo-compressed.jpg"
+                comparison = self.sample_dir / "photo-comparison.jpg"
+                encode(self.source, compressed, "image", settings)
+                make_preview(self.source, compressed, "image", comparison)
+                samples = [comparison]
+            self.app.call_from_thread(self._preview_updated, samples, settings, None)
+        except Exception as exc:
+            self.app.call_from_thread(self._preview_updated, None, settings, str(exc))
+
+    def _preview_updated(
+        self, samples: list[Path] | None, settings: EncodingSettings, error: str | None
+    ) -> None:
+        self._regenerating = False
+        self.query_one("#regenerate", Button).disabled = False
+        if error:
+            self.query_one("#quality-heading", Static).update(f"Preview failed: {error}")
+            return
+        self.sample_paths = samples or []
+        self.settings = settings
+        self.previewed_settings = settings
+        self.sample_index = 0
+        self._show_sample(0)
+
+    def _accept_settings(self) -> None:
+        if self._regenerating:
+            self.notify("Wait for the preview update to finish", severity="warning")
+            return
+        settings = self._read_settings()
+        if settings is None:
+            return
+        if settings != self.previewed_settings:
+            self.notify("Update the preview before accepting changed settings", severity="warning")
+            return
+        self.dismiss(settings)
+
+    def action_cancel(self) -> None:
+        if self._regenerating:
+            self.notify("Wait for the preview update to finish", severity="warning")
+            return
+        if self._timer is not None:
+            self._timer.stop()
+        self.dismiss(None)
+
+    def on_unmount(self) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+        self.temp_dir.cleanup()
+
+
+class ThumbnailScreen(ModalScreen[None]):
+    """Original-only four-frame video sheet used for fast visual identification."""
+
+    CSS = """
+    #thumbnail-dialog { width: 100%; height: 100%; padding: 1; background: $surface; }
+    #thumbnail-image { height: 1fr; content-align: center middle; overflow: hidden; }
+    #thumbnail-heading { height: 1; color: $accent; }
+    #thumbnail-close { height: 3; align: center middle; }
+    """
+    BINDINGS = [Binding("escape", "close", "Close")]
+
+    def __init__(self, title: str, image_path: Path, temp_dir: tempfile.TemporaryDirectory[str]):
+        super().__init__()
+        self.title_text = title
+        self.image_path = image_path
+        self.temp_dir = temp_dir
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="thumbnail-dialog"):
+            yield Static(f"{self.title_text} · original video samples", id="thumbnail-heading")
+            yield Static(image_to_terminal(self.image_path, max_width=100, max_rows=26), id="thumbnail-image")
+            with Horizontal(id="thumbnail-close"):
+                yield Button("Close", variant="primary", id="close")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(None)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class MediaApp(App[None]):
     TITLE = "Android Media Shrinker"
     CSS = """
@@ -119,6 +324,7 @@ class MediaApp(App[None]):
         Binding("enter", "open_or_toggle", "Open/select", priority=True),
         Binding("backspace", "parent", "Parent", priority=True),
         Binding("p", "preview", "Preview", priority=True),
+        Binding("v", "thumbnails", "Video thumbs", priority=True),
         Binding("c", "compress", "Compress", priority=True),
         Binding("s", "settings", "Settings", priority=True),
         Binding("r", "restore", "Backups/restore", priority=True),
@@ -126,7 +332,7 @@ class MediaApp(App[None]):
         Binding("i", "toggle_images", "Toggle JPEGs", priority=True),
     ]
     _MAIN_ACTIONS = {
-        "quit", "toggle", "open_or_toggle", "parent", "preview", "compress",
+        "quit", "toggle", "open_or_toggle", "parent", "preview", "thumbnails", "compress",
         "settings", "restore", "refresh", "toggle_images",
     }
 
@@ -150,7 +356,7 @@ class MediaApp(App[None]):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static(self.path, id="path")
-        yield Static("↑↓ navigate · Space select · Enter open/select · P preview · C compress · S settings · R backups · Backspace up · Q quit", id="help")
+        yield Static("↑↓ navigate · Space select · Enter open/select · V identify video · P quality/settings preview · C compress · S settings · R backups · Backspace up · Q quit", id="help")
         table = DataTable(id="files", cursor_type="row", zebra_stripes=True)
         table.add_columns("Sel", "Type", "Size", "Name")
         yield table
@@ -204,9 +410,16 @@ class MediaApp(App[None]):
         if item and not item.is_dir:
             if item.path in self.selected:
                 del self.selected[item.path]
+                marker = "[ ]"
             else:
                 self.selected[item.path] = item
-            self.refresh_listing()
+                marker = "[x]"
+            table = self.query_one("#files", DataTable)
+            table.update_cell_at(Coordinate(table.cursor_row, 0), marker)
+            self._status(
+                f"{len(self.selected)} selected · {sum(entry.size for entry in self.selected.values()) / 1024**2:.1f} MiB · "
+                f"CRF {self.settings.video_crf} / JPEG {self.settings.jpeg_quality}"
+            )
 
     def action_open_or_toggle(self) -> None:
         item = self._current()
@@ -253,29 +466,66 @@ class MediaApp(App[None]):
         self._status(f"Preparing quick quality preview for {item.name}…")
         self._preview_worker(item)
 
+    def action_thumbnails(self) -> None:
+        item = next(iter(self.selected.values()), None) or self._current()
+        if not item or item.is_dir or item.suffix not in VIDEO_EXTENSIONS:
+            self._status("Highlight or select a video first")
+            return
+        self._status(f"Reading video for identification thumbnails: {item.name}…")
+        self._thumbnail_worker(item)
+
     @work(thread=True, exclusive=True)
     def _preview_worker(self, item: RemoteItem) -> None:
+        temp_dir = tempfile.TemporaryDirectory(prefix="media-quality-preview-")
         try:
             kind = "video" if item.suffix in VIDEO_EXTENSIONS else "image"
-            with tempfile.TemporaryDirectory(prefix="media-preview-") as td:
-                directory = Path(td)
-                source = directory / ("original" + item.suffix)
-                compressed = directory / ("compressed" + item.suffix)
-                preview = directory / "quality-comparison.jpg"
-                self.adb.pull(item.path, str(source))
-                if kind == "video":
-                    make_video_quality_preview(source, self.settings, preview)
-                else:
-                    encode(source, compressed, kind, self.settings)
-                    make_preview(source, compressed, kind, preview)
-                # The comparison file must survive the temporary-directory cleanup.
-                persistent = self.backups.root / "previews" / f"{Path(item.name).stem}-comparison.jpg"
-                persistent.parent.mkdir(parents=True, exist_ok=True)
-                preview.replace(persistent)
-                webbrowser.open(persistent.resolve().as_uri())
-            self.call_from_thread(self._status, f"Quality comparison opened: {persistent}")
+            directory = Path(temp_dir.name)
+            source = directory / ("original" + item.suffix)
+            sample_dir = directory / "samples"
+            sample_dir.mkdir()
+            settings = self.settings
+            self.adb.pull(item.path, str(source))
+            if kind == "video":
+                samples = make_video_quality_samples(source, settings, sample_dir)
+            else:
+                compressed = sample_dir / "photo-compressed.jpg"
+                comparison = sample_dir / "photo-comparison.jpg"
+                encode(source, compressed, kind, settings)
+                make_preview(source, compressed, kind, comparison)
+                samples = [comparison]
+            screen = QualityPreviewScreen(item.name, kind, source, sample_dir, samples, settings, temp_dir)
+            self.call_from_thread(self._open_quality_preview, screen)
         except Exception as exc:
+            temp_dir.cleanup()
             self.call_from_thread(self._status, f"Preview failed: {exc}")
+
+    def _open_quality_preview(self, screen: QualityPreviewScreen) -> None:
+        self.push_screen(screen, callback=self._quality_preview_closed)
+
+    def _quality_preview_closed(self, settings: EncodingSettings | None) -> None:
+        if settings is not None:
+            self.settings = settings
+            self._status(
+                f"Preview settings saved · CRF {settings.video_crf} / JPEG {settings.jpeg_quality} / "
+                f"minimum saving {settings.min_saving_percent:g}%"
+            )
+
+    @work(thread=True, exclusive=True)
+    def _thumbnail_worker(self, item: RemoteItem) -> None:
+        temp_dir = tempfile.TemporaryDirectory(prefix="media-identification-thumbnails-")
+        try:
+            source = Path(temp_dir.name) / ("original" + item.suffix)
+            sheet = Path(temp_dir.name) / "video-thumbnails.jpg"
+            self.adb.pull(item.path, str(source))
+            make_video_thumbnail_sheet(source, sheet)
+            screen = ThumbnailScreen(item.name, sheet, temp_dir)
+            self.call_from_thread(self._open_thumbnail_preview, screen)
+        except Exception as exc:
+            temp_dir.cleanup()
+            self.call_from_thread(self._status, f"Thumbnail preview failed: {exc}")
+
+    def _open_thumbnail_preview(self, screen: ThumbnailScreen) -> None:
+        self.push_screen(screen, callback=lambda _: self._status("Video thumbnail preview closed"))
 
     def action_compress(self) -> None:
         items = list(self.selected.values())

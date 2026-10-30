@@ -16,7 +16,7 @@ uv run android-media-shrinker check
 uv run android-media-shrinker
 ```
 
-The TUI opens at `/sdcard`, the shared-storage root visible to Android file explorers. Browse folders such as `DCIM`, `Download`, `Movies`, and `Pictures`; app-private `Android/data` and `Android/obb` are excluded. Navigate with arrows; Space selects, Enter opens a folder or toggles a file, Backspace goes up, `P` previews, `C` compresses selected files after confirmation, `S` edits settings, `I` toggles JPEG visibility, and `R` lists/restores backups.
+The TUI opens at `/sdcard`, the shared-storage root visible to Android file explorers. Browse folders such as `DCIM`, `Download`, `Movies`, and `Pictures`; hidden entries and app-private `Android/data` and `Android/obb` are excluded. Navigate with arrows; Space selects, Enter opens a folder or toggles a file, Backspace goes up, `V` opens four original-only video thumbnails to identify a clip, `P` opens the original/compressed quality comparison with editable settings, `C` compresses selected files after confirmation, `S` edits settings, `I` toggles JPEG visibility, and `R` lists/restores backups.
 
 ## External tools
 
@@ -34,7 +34,7 @@ uv run android-media-shrinker backups
 uv run android-media-shrinker restore <backup-id>
 ```
 
-`compress` is preview/dry-run by default. Add `--apply` to replace after an interactive `REPLACE` confirmation; `--yes` skips that prompt and is intended only for deliberate scripts. JPEG work always requires `--include-images`. `preview` downloads the source and opens a side-by-side comparison in the system viewer. Video previews encode only three representative still frames (roughly 20%, 50%, and 80% of the clip), rather than re-encoding the whole video; they use FFmpeg's fast preset, so treat this as a quick quality estimate, not a guarantee of final playback quality. Adjust parameters with `--crf`, `--jpeg-quality`, and `--min-saving-percent` or the TUI settings screen.
+`compress` is preview/dry-run by default. Add `--apply` to replace after an interactive `REPLACE` confirmation; `--yes` skips that prompt and is intended only for deliberate scripts. JPEG work always requires `--include-images`. In the TUI, `V` shows a 2×2 original-only frame sheet for quick video identification. `P` shows one original/compressed sample at a time at 15%, 38%, 62%, and 85%; use Previous/Next or optional 0.3-second auto-cycle. Edit CRF/JPEG/minimum-saving settings in that same screen, update the preview, then choose “Use these settings”. Video comparisons encode only still frames with FFmpeg's fast preset, not the full clip, so treat them as quality estimates rather than guarantees of final playback quality. The CLI `preview` command opens a contact sheet in the system viewer.
 
 ## Safety and recovery
 

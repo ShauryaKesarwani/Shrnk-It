@@ -6,7 +6,16 @@ import pytest
 
 from pc_shrinker.adb import AdbClient
 from pc_shrinker.backups import BackupStore
-from pc_shrinker.encoding import EncodingSettings, encode, make_preview, make_video_quality_preview
+from pc_shrinker.encoding import (
+    EncodingSettings,
+    encode,
+    image_to_terminal,
+    make_preview,
+    make_video_quality_preview,
+    make_video_quality_samples,
+    make_video_thumbnail_sheet,
+    persist_preview,
+)
 from pc_shrinker.processor import compress_one, media_kind
 
 
@@ -51,6 +60,29 @@ def test_android_listing_hides_restricted_data_and_obb_folders(monkeypatch):
     listed = client.list_dir("/sdcard/Android")
 
     assert [item.path for item in listed] == ["/sdcard/Android/media"]
+
+
+def test_shared_storage_root_uses_physical_path_and_returns_sdcard_alias(monkeypatch):
+    import subprocess
+
+    client = AdbClient(executable="adb")
+    captured = {}
+    output = "\n".join([
+        "directory|0|1|/storage/emulated/0/DCIM",
+        "directory|0|1|/storage/emulated/0/.hidden",
+        "directory|0|1|/storage/emulated/0/$recycle$",
+        "regular file|42|2|/storage/emulated/0/read me.txt",
+    ])
+
+    def fake_shell(command, check=True):
+        captured["command"] = command
+        return subprocess.CompletedProcess([], 0, output, "")
+
+    monkeypatch.setattr(client, "shell", fake_shell)
+    listed = client.list_dir("/sdcard")
+
+    assert "find /storage/emulated/0 " in captured["command"]
+    assert {item.path for item in listed} == {"/sdcard/DCIM", "/sdcard/read me.txt"}
 
 
 def test_adb_passes_windows_paths_as_single_subprocess_arguments(monkeypatch):
@@ -254,4 +286,35 @@ def test_video_quality_preview_encodes_only_sample_frames(tmp_path: Path):
 
     from PIL import Image
     with Image.open(comparison) as sheet:
-        assert sheet.size == (960, (300 + 32) * 3)
+        assert sheet.size == (960, (300 + 32) * 4)
+
+
+def test_video_identification_thumbnails_and_interactive_samples(tmp_path: Path):
+    import subprocess
+
+    source = tmp_path / "source.mp4"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+         "testsrc=size=160x120:rate=8", "-t", "1.5", "-pix_fmt", "yuv420p", "-y", str(source)],
+        check=True,
+    )
+
+    thumbnails = make_video_thumbnail_sheet(source, tmp_path / "thumbnails.jpg")
+    samples = make_video_quality_samples(source, EncodingSettings(video_crf=30), tmp_path / "samples")
+    terminal_render = image_to_terminal(thumbnails)
+
+    assert thumbnails.is_file()
+    assert len(samples) == 4 and all(path.is_file() for path in samples)
+    assert terminal_render.plain and "▀" in terminal_render.plain
+
+
+def test_preview_persistence_copies_to_destination_without_rename(tmp_path: Path):
+    source = tmp_path / "temporary" / "preview.jpg"
+    destination = tmp_path / "backups" / "previews" / "preview.jpg"
+    source.parent.mkdir()
+    source.write_bytes(b"preview image")
+
+    persist_preview(source, destination)
+
+    assert source.read_bytes() == destination.read_bytes() == b"preview image"
+    assert source.exists()
