@@ -22,7 +22,7 @@ from .encoding import (
     make_video_quality_preview,
     persist_preview,
 )
-from .processor import compress_one, media_kind
+from .processor import media_kind, prepare_one, replace_prepared
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LOCAL_BIN = PROJECT_ROOT / "bins"
@@ -239,17 +239,44 @@ def compress_files(args: argparse.Namespace, backups: BackupStore) -> None:
         raise ValueError("--yes requires --apply")
     adb = AdbClient()
     adb.require_one_device()
-    if args.apply and not args.yes:
-        print("This will replace phone files after backing up the originals.")
-        if input("Type REPLACE to continue: ").strip() != "REPLACE":
-            print("Cancelled; phone unchanged.")
-            return
-    for path in args.paths:
-        result = compress_one(adb, backups, path, settings, apply=args.apply)
-        if result.get("replaced"):
-            print(f"Replaced {path}; saved {result['saving_percent']}%; backup id {result['backup_id']}")
-        else:
-            print(f"Skipped {path}: {result.get('reason')}")
+    for index, path in enumerate(args.paths, start=1):
+        print(f"[{index}/{len(args.paths)}] Preparing {path}", flush=True)
+        prepared = prepare_one(adb, path, settings, on_stage=lambda stage: print(f"  {stage}…", flush=True))
+        try:
+            result = prepared.result()
+            if prepared.saving_percent < settings.min_saving_percent:
+                result["reason"] = (
+                    f"Saving {prepared.saving_percent:.1f}% is below the "
+                    f"{settings.min_saving_percent:.1f}% minimum"
+                )
+            elif not args.apply:
+                result["reason"] = "Preview only; phone unchanged"
+            else:
+                print(
+                    f"  Ready to replace: {_format_bytes(prepared.old_size)} → "
+                    f"{_format_bytes(prepared.new_size)} ({prepared.saving_percent:.1f}% smaller)."
+                )
+                if not args.yes and input("  Replace this file now? Type REPLACE: ").strip() != "REPLACE":
+                    result["reason"] = "Replacement declined; phone unchanged"
+                else:
+                    result = replace_prepared(
+                        adb, backups, prepared,
+                        on_stage=lambda stage: print(f"  {stage}…", flush=True),
+                    )
+            if result.get("replaced"):
+                print(f"  Replaced {path}; saved {result['saving_percent']}%; backup id {result['backup_id']}")
+            else:
+                print(f"  Skipped {path}: {result.get('reason')}")
+        finally:
+            prepared.cleanup()
+
+
+def _format_bytes(size: int) -> str:
+    if size >= 1024**3:
+        return f"{size / 1024**3:.2f} GiB"
+    if size >= 1024**2:
+        return f"{size / 1024**2:.1f} MiB"
+    return f"{size / 1024:.0f} KiB"
 
 
 def list_backups(backups: BackupStore) -> None:

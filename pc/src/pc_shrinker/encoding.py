@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from PIL import Image, ImageOps
 
@@ -45,21 +46,47 @@ def persist_preview(source: Path, destination: Path) -> Path:
     return destination
 
 
-def encode(source: Path, destination: Path, kind: str, settings: EncodingSettings) -> None:
+def encode(
+    source: Path,
+    destination: Path,
+    kind: str,
+    settings: EncodingSettings,
+    *,
+    on_progress: Callable[[int, int | None], None] | None = None,
+) -> None:
     settings.validate()
     if kind == "video":
         if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
             raise EncodingError("FFmpeg and ffprobe are required for video compression")
         command = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", str(source),
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-progress", "pipe:1",
+            "-stats_period", "0.25", "-i", str(source),
             "-map", "0:v:0", "-map", "0:a?", "-map_metadata", "0", "-map_chapters", "0",
             "-c:v", "libx265", "-preset", "medium", "-crf", str(settings.video_crf),
             "-pix_fmt", "yuv420p", "-tag:v", "hvc1", "-c:a", "copy", "-movflags", "+faststart",
             str(destination),
         ]
-        result = subprocess.run(command, text=True, capture_output=True, check=False)
-        if result.returncode:
-            raise EncodingError(result.stderr.strip() or "FFmpeg encoding failed")
+        if on_progress is None:
+            result = subprocess.run(command, text=True, capture_output=True, check=False)
+            if result.returncode:
+                raise EncodingError(result.stderr.strip() or "FFmpeg encoding failed")
+        else:
+            total_frames = _estimated_video_frames(source)
+            process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            assert process.stdout is not None
+            last_frame = 0
+            for line in process.stdout:
+                key, separator, value = line.strip().partition("=")
+                if separator and key == "frame":
+                    try:
+                        last_frame = int(value)
+                        on_progress(last_frame, total_frames)
+                    except ValueError:
+                        continue
+            stderr = process.stderr.read() if process.stderr else ""
+            return_code = process.wait()
+            if return_code:
+                raise EncodingError(stderr.strip() or "FFmpeg encoding failed")
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
              "stream=codec_name", "-of", "default=nw=1:nk=1", str(destination)],
@@ -248,6 +275,27 @@ def _video_duration(path: Path) -> float:
     if result.returncode or duration <= 0:
         raise EncodingError("Could not determine video duration for quality preview")
     return duration
+
+
+def _estimated_video_frames(path: Path) -> int | None:
+    """Estimate video frame count from duration and average frame rate."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=avg_frame_rate", "-show_entries", "format=duration", "-of", "default=nw=1", str(path)],
+        text=True, capture_output=True, check=False,
+    )
+    values = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key] = value
+    try:
+        numerator, denominator = values["avg_frame_rate"].split("/", 1)
+        fps = float(numerator) / float(denominator)
+        total = round(float(values["duration"]) * fps)
+        return total if total > 0 else None
+    except (KeyError, ValueError, ZeroDivisionError):
+        return None
 
 
 def _write_contact_sheet(

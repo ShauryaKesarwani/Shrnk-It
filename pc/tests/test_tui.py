@@ -49,10 +49,12 @@ def test_tui_starts_at_shared_storage_root_and_space_marks_selection(monkeypatch
     asyncio.run(exercise())
 
 
-def test_compress_key_opens_confirmation_screen_without_crashing(monkeypatch, tmp_path: Path):
+def test_compress_key_starts_preparation_before_confirmation(monkeypatch, tmp_path: Path):
     import pc_shrinker.tui as tui_module
 
     monkeypatch.setattr(tui_module, "AdbClient", FakeAdb)
+    prepared = []
+    monkeypatch.setattr(tui_module.MediaApp, "_prepare_next", lambda self: prepared.append(self._batch_items[0].path))
     app = MediaApp(start="/sdcard", backup_dir=tmp_path)
 
     async def exercise():
@@ -64,7 +66,8 @@ def test_compress_key_opens_confirmation_screen_without_crashing(monkeypatch, tm
             await pilot.pause()
             await pilot.press("c")
             await pilot.pause()
-            assert isinstance(app.screen, DecisionScreen)
+            assert not isinstance(app.screen, DecisionScreen)
+            assert prepared == ["/sdcard/DCIM/sample.mp4"]
 
     asyncio.run(exercise())
 
@@ -239,5 +242,28 @@ def test_video_thumbnail_key_opens_inline_original_sheet(monkeypatch, tmp_path: 
                     break
             assert isinstance(app.screen, ThumbnailScreen)
             await pilot.press("escape")
+
+    asyncio.run(exercise())
+
+
+def test_progress_indicators_are_hidden_until_batch_processing(monkeypatch, tmp_path: Path):
+    import pc_shrinker.tui as tui_module
+
+    monkeypatch.setattr(tui_module, "AdbClient", FakeAdb)
+    app = MediaApp(start="/sdcard", backup_dir=tmp_path)
+
+    async def exercise():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.query_one("#batch-progress", tui_module.ProgressBar).styles.display == "none"
+            assert app.query_one("#stage-progress", tui_module.ProgressBar).styles.display == "none"
+            app._batch_items = [RemoteItem("/sdcard/a.mp4", False, 1, 0)] * 5
+            app._batch_index = 2
+            app._set_progress_visible(True)
+            messages = []
+            app._status = messages.append
+            app._encoding_progress(120, 500)
+            assert "3/5" in messages[-1]
+            assert "120/500 frames" in messages[-1]
 
     asyncio.run(exercise())

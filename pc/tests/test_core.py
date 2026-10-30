@@ -16,7 +16,7 @@ from pc_shrinker.encoding import (
     make_video_thumbnail_sheet,
     persist_preview,
 )
-from pc_shrinker.processor import compress_one, media_kind
+from pc_shrinker.processor import compress_one, media_kind, prepare_one, replace_prepared
 
 
 def test_settings_validation_and_defaults():
@@ -101,6 +101,25 @@ def test_adb_passes_windows_paths_as_single_subprocess_arguments(monkeypatch):
     client.pull("/sdcard/DCIM/media file.mp4", local_path)
 
     assert captured["args"] == ["adb.exe", "pull", "-a", "/sdcard/DCIM/media file.mp4", local_path]
+
+
+def test_adb_open_on_device_uses_media_store_view_intent(monkeypatch):
+    import subprocess
+
+    client = AdbClient(executable="adb")
+    commands = []
+
+    def fake_shell(command, check=True):
+        commands.append(command)
+        output = "Row: 0 _id=42" if command.startswith("content query") else "Starting: Intent"
+        return subprocess.CompletedProcess([], 0, output, "")
+
+    monkeypatch.setattr(client, "shell", fake_shell)
+    client.open_on_device("/sdcard/DCIM/my clip.mp4")
+
+    assert "DCIM/my clip.mp4" in commands[0]
+    assert "content://media/external/file/42" in commands[1]
+    assert "video/mp4" in commands[1]
 
 
 def test_windows_global_install_uses_separate_adb_and_ffmpeg_packages(monkeypatch):
@@ -240,6 +259,28 @@ def test_compression_creates_backup_before_phone_write(tmp_path: Path, monkeypat
     assert adb.scanned == "/sdcard/DCIM/clip.mp4"
 
 
+def test_prepare_candidate_does_not_write_phone_until_replace(tmp_path: Path, monkeypatch):
+    import pc_shrinker.processor as processor
+
+    adb = FakeProcessingAdb(b"original video payload")
+    backups = BackupStore(tmp_path / "backups")
+    stages = []
+    monkeypatch.setattr(processor, "encode", lambda source, destination, kind, settings: destination.write_bytes(b"tiny"))
+
+    prepared = prepare_one(adb, "/sdcard/DCIM/clip.mp4", EncodingSettings(), on_stage=stages.append)
+    assert adb.push_record is None
+    assert stages == ["Pulling original from phone", "Encoding compressed candidate"]
+
+    try:
+        stages.clear()
+        result = replace_prepared(adb, backups, prepared, on_stage=stages.append)
+        assert result["replaced"] is True
+        assert stages == ["Saving original backup", "Replacing phone file", "Refreshing Android media library"]
+        assert backups.verify(backups.get(str(result["backup_id"]))).read_bytes() == b"original video payload"
+    finally:
+        prepared.cleanup()
+
+
 def test_compression_below_saving_threshold_never_backs_up_or_pushes(tmp_path: Path, monkeypatch):
     import pc_shrinker.processor as processor
 
@@ -283,10 +324,14 @@ def test_video_quality_preview_encodes_only_sample_frames(tmp_path: Path):
     )
 
     make_video_quality_preview(source, EncodingSettings(video_crf=30), comparison)
+    frame_updates = []
+    encode(source, tmp_path / "encoded.mp4", "video", EncodingSettings(video_crf=30),
+           on_progress=lambda frame, total: frame_updates.append((frame, total)))
 
     from PIL import Image
     with Image.open(comparison) as sheet:
         assert sheet.size == (960, (300 + 32) * 4)
+    assert frame_updates and frame_updates[-1] == (12, 12)
 
 
 def test_video_identification_thumbnails_and_interactive_samples(tmp_path: Path):

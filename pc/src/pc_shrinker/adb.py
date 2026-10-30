@@ -7,6 +7,9 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+from urllib.parse import quote
+import mimetypes
+import re
 
 SHARED_STORAGE = "/storage/emulated/0"
 
@@ -147,3 +150,30 @@ class AdbClient:
         )
         if result.returncode:
             raise AdbError(result.stderr.strip() or "MediaStore scan failed")
+
+    def open_on_device(self, path: str) -> None:
+        """Launch Android's registered viewer for a shared-storage media file."""
+        path = self.validate_path(path)
+        mime_type = mimetypes.guess_type(path)[0]
+        if not mime_type or not mime_type.startswith(("video/", "image/")):
+            raise ValueError("Only supported video and image files can be opened on the phone")
+
+        # Prefer MediaStore content URIs: unlike file:// URIs, Android apps can
+        # safely receive them through the standard VIEW intent and show a chooser.
+        physical_path = SHARED_STORAGE + path.removeprefix("/sdcard")
+        sql_path = physical_path.replace("'", "''")
+        where = f"_data='{sql_path}'"
+        query = self.shell(
+            "content query --uri content://media/external/file --projection _id "
+            f"--where {shlex.quote(where)}",
+            check=False,
+        )
+        row = re.search(r"_id=(\d+)", query.stdout)
+        uri = f"content://media/external/file/{row.group(1)}" if row else "file://" + quote(physical_path, safe="/")
+        result = self.shell(
+            "am start -a android.intent.action.VIEW "
+            f"-d {shlex.quote(uri)} -t {shlex.quote(mime_type)}",
+            check=False,
+        )
+        if result.returncode:
+            raise AdbError(result.stderr.strip() or result.stdout.strip() or "No phone app can open this file")

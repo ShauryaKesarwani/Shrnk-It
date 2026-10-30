@@ -11,7 +11,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.coordinate import Coordinate
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Static
+from textual.widgets import Button, DataTable, Footer, Header, Input, Label, ProgressBar, Static
 
 from .adb import AdbClient, RemoteItem
 from .backups import BackupStore
@@ -26,7 +26,7 @@ from .encoding import (
     make_video_quality_samples,
     make_video_thumbnail_sheet,
 )
-from .processor import compress_one
+from .processor import PreparedCompression, prepare_one, replace_prepared
 
 ANDROID_ROOT = "/sdcard"
 
@@ -144,7 +144,7 @@ class QualityPreviewScreen(ModalScreen[EncodingSettings | None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="quality-dialog"):
             yield Static(self._heading(), id="quality-heading")
-            yield Static(image_to_terminal(self.sample_paths[0]), id="quality-image")
+            yield Static(image_to_terminal(self.sample_paths[0], max_width=140, max_rows=40), id="quality-image")
             with Horizontal(id="quality-nav"):
                 yield Button("Previous", id="previous", disabled=len(self.sample_paths) < 2)
                 yield Button("Auto 0.3s", id="auto", disabled=len(self.sample_paths) < 2)
@@ -296,7 +296,7 @@ class ThumbnailScreen(ModalScreen[None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="thumbnail-dialog"):
             yield Static(f"{self.title_text} · original video samples", id="thumbnail-heading")
-            yield Static(image_to_terminal(self.image_path, max_width=100, max_rows=26), id="thumbnail-image")
+            yield Static(image_to_terminal(self.image_path, max_width=140, max_rows=40), id="thumbnail-image")
             with Horizontal(id="thumbnail-close"):
                 yield Button("Close", variant="primary", id="close")
 
@@ -325,6 +325,7 @@ class MediaApp(App[None]):
         Binding("backspace", "parent", "Parent", priority=True),
         Binding("p", "preview", "Preview", priority=True),
         Binding("v", "thumbnails", "Video thumbs", priority=True),
+        Binding("o", "open_on_phone", "Open on phone", priority=True),
         Binding("c", "compress", "Compress", priority=True),
         Binding("s", "settings", "Settings", priority=True),
         Binding("r", "restore", "Backups/restore", priority=True),
@@ -332,7 +333,7 @@ class MediaApp(App[None]):
         Binding("i", "toggle_images", "Toggle JPEGs", priority=True),
     ]
     _MAIN_ACTIONS = {
-        "quit", "toggle", "open_or_toggle", "parent", "preview", "thumbnails", "compress",
+        "quit", "toggle", "open_or_toggle", "parent", "preview", "thumbnails", "open_on_phone", "compress",
         "settings", "restore", "refresh", "toggle_images",
     }
 
@@ -356,14 +357,17 @@ class MediaApp(App[None]):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static(self.path, id="path")
-        yield Static("↑↓ navigate · Space select · Enter open/select · V identify video · P quality/settings preview · C compress · S settings · R backups · Backspace up · Q quit", id="help")
+        yield Static("↑↓ navigate · Space select · Enter open/select · V identify video · O open on phone · P quality/settings preview · C compress · S settings · R backups · Backspace up · Q quit", id="help")
         table = DataTable(id="files", cursor_type="row", zebra_stripes=True)
         table.add_columns("Sel", "Type", "Size", "Name")
         yield table
+        yield ProgressBar(total=1, show_eta=False, id="batch-progress")
+        yield ProgressBar(total=1, show_eta=False, id="stage-progress")
         yield Static("Checking connected device…", id="status")
         yield Footer()
 
     def on_mount(self) -> None:
+        self._set_progress_visible(False)
         try:
             device = self.adb.require_one_device()
             tools = available_tools()
@@ -474,6 +478,22 @@ class MediaApp(App[None]):
         self._status(f"Reading video for identification thumbnails: {item.name}…")
         self._thumbnail_worker(item)
 
+    def action_open_on_phone(self) -> None:
+        item = next(iter(self.selected.values()), None) or self._current()
+        if not item or item.is_dir:
+            self._status("Highlight or select a video/photo first")
+            return
+        self._status(f"Opening on phone: {item.name}…")
+        self._open_on_phone_worker(item)
+
+    @work(thread=True, exclusive=True)
+    def _open_on_phone_worker(self, item: RemoteItem) -> None:
+        try:
+            self.adb.open_on_device(item.path)
+            self.call_from_thread(self._status, f"Opened {item.name} on phone (Android may show an app chooser)")
+        except Exception as exc:
+            self.call_from_thread(self._status, f"Could not open on phone: {exc}")
+
     @work(thread=True, exclusive=True)
     def _preview_worker(self, item: RemoteItem) -> None:
         temp_dir = tempfile.TemporaryDirectory(prefix="media-quality-preview-")
@@ -536,27 +556,121 @@ class MediaApp(App[None]):
         if unsupported:
             self._status("Unsupported selection: " + ", ".join(unsupported))
             return
-        self.push_screen(DecisionScreen(
-            f"Compress and replace {len(items)} phone file(s)? Originals will be backed up first.\n"
-            f"CRF {self.settings.video_crf}, JPEG {self.settings.jpeg_quality}, minimum saving {self.settings.min_saving_percent:g}%."
-        ), callback=lambda accepted: self._confirm_compression(accepted, items, self.settings))
+        self._batch_items = items
+        self._batch_settings = self.settings
+        self._batch_index = 0
+        self._batch_results = []
+        self._set_progress_visible(True)
+        progress = self.query_one("#batch-progress", ProgressBar)
+        progress.update(total=len(items), progress=0)
+        self.query_one("#stage-progress", ProgressBar).update(total=None, progress=0)
+        self._prepare_next()
 
-    def _confirm_compression(
-        self, accepted: bool, items: list[RemoteItem], settings: EncodingSettings
-    ) -> None:
-        if accepted:
-            self._compress_worker(items, settings)
+    def _prepare_next(self) -> None:
+        if self._batch_index >= len(self._batch_items):
+            self.query_one("#stage-progress", ProgressBar).update(total=1, progress=1)
+            self._set_progress_visible(False)
+            self._status(f"Batch complete · {self._batch_index}/{len(self._batch_items)} file(s) processed")
+            self.refresh_listing()
+            return
+        item = self._batch_items[self._batch_index]
+        self.query_one("#stage-progress", ProgressBar).update(total=None, progress=0)
+        self._status(f"Preparing {self._batch_index + 1}/{len(self._batch_items)}: {item.name}")
+        self._prepare_worker(item, self._batch_settings)
 
     @work(thread=True, exclusive=True)
-    def _compress_worker(self, items: list[RemoteItem], settings: EncodingSettings) -> None:
-        for index, item in enumerate(items, start=1):
-            self.call_from_thread(self._status, f"Processing {index}/{len(items)}: {item.name}")
-            try:
-                result = compress_one(self.adb, self.backups, item.path, settings, apply=True)
-                self.call_from_thread(self._status, _result_text(result))
-            except Exception as exc:
-                self.call_from_thread(self._status, f"Failed {item.name}: {exc}")
-        self.call_from_thread(self.refresh_listing)
+    def _prepare_worker(self, item: RemoteItem, settings: EncodingSettings) -> None:
+        try:
+            prepared = prepare_one(
+                self.adb, item.path, settings,
+                on_stage=lambda stage: self.call_from_thread(self._processing_stage, stage),
+                on_progress=lambda frame, total: self.call_from_thread(self._encoding_progress, frame, total),
+            )
+            self.call_from_thread(self._prepared_ready, prepared)
+        except Exception as exc:
+            self.call_from_thread(self._file_failed, item.name, str(exc))
+
+    def _processing_stage(self, stage: str) -> None:
+        self._status(f"{self._batch_index + 1}/{len(self._batch_items)} · {stage}")
+        self.query_one("#stage-progress", ProgressBar).update(total=None, progress=0)
+
+    def _encoding_progress(self, frame: int, total: int | None) -> None:
+        if total:
+            self.query_one("#stage-progress", ProgressBar).update(total=total, progress=min(frame, total))
+            remaining = max(0, total - frame)
+            self._status(
+                f"{self._batch_index + 1}/{len(self._batch_items)} · Encoding compressed candidate · "
+                f"{frame:,}/{total:,} frames ({remaining:,} left)"
+            )
+        else:
+            self._status(f"{self._batch_index + 1}/{len(self._batch_items)} · Encoding compressed candidate · frame {frame:,}")
+            self.query_one("#stage-progress", ProgressBar).update(total=None, progress=0)
+
+    def _set_progress_visible(self, visible: bool) -> None:
+        for widget_id in ("#batch-progress", "#stage-progress"):
+            self.query_one(widget_id, ProgressBar).styles.display = "block" if visible else "none"
+
+    def _prepared_ready(self, prepared: PreparedCompression) -> None:
+        self._prepared = prepared
+        result = prepared.result()
+        if prepared.saving_percent < prepared.settings.min_saving_percent:
+            prepared.cleanup()
+            self._batch_results.append(result)
+            self._status(_result_text({**result, "reason": "Below minimum saving"}))
+            self._finish_file()
+            return
+        message = (
+            f"Ready to replace {prepared.phone_path}?\n"
+            f"Encoded: {_pretty(prepared.old_size)} → {_pretty(prepared.new_size)} "
+            f"({prepared.saving_percent:.1f}% smaller).\n"
+            "The original will be backed up now, immediately before replacement."
+        )
+        self.push_screen(DecisionScreen(message), callback=self._confirm_prepared)
+
+    def _confirm_prepared(self, accepted: bool) -> None:
+        prepared = self._prepared
+        if not accepted:
+            prepared.cleanup()
+            self._batch_results.append({**prepared.result(), "reason": "Replacement declined"})
+            self._status(f"Kept original: {prepared.phone_path}")
+            self._finish_file()
+            return
+        self.query_one("#stage-progress", ProgressBar).update(total=None, progress=0)
+        self.query_one("#stage-progress", ProgressBar).styles.display = "block"
+        self._replace_worker(prepared)
+
+    @work(thread=True, exclusive=True)
+    def _replace_worker(self, prepared: PreparedCompression) -> None:
+        try:
+            result = replace_prepared(
+                self.adb, self.backups, prepared,
+                on_stage=lambda stage: self.call_from_thread(self._processing_stage, stage),
+            )
+            self.call_from_thread(self._replacement_finished, prepared, result, None)
+        except Exception as exc:
+            self.call_from_thread(self._replacement_finished, prepared, None, str(exc))
+
+    def _replacement_finished(
+        self, prepared: PreparedCompression, result: dict[str, object] | None, error: str | None
+    ) -> None:
+        prepared.cleanup()
+        if result is not None:
+            self._batch_results.append(result)
+            self._status(_result_text(result))
+        else:
+            self._batch_results.append({"path": prepared.phone_path, "reason": error})
+            self._status(f"Failed {prepared.phone_path}: {error}")
+        self._finish_file()
+
+    def _file_failed(self, name: str, error: str) -> None:
+        self._batch_results.append({"path": name, "reason": error})
+        self._status(f"Failed {name}: {error}")
+        self._finish_file()
+
+    def _finish_file(self) -> None:
+        self._batch_index += 1
+        self.query_one("#batch-progress", ProgressBar).advance(1)
+        self._prepare_next()
 
     def action_restore(self) -> None:
         records = self.backups.records()
